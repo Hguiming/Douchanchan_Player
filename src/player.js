@@ -19,12 +19,13 @@
   // 也从原来的滚动相位继续，而不是重新从开头刷新。
   let audioMarqueeEpoch = 0;
   let audioMarqueeKey = '';
+  let audioButtonBaseWidth = 0;
   const AUDIO_MARQUEE_DURATION_MS = 7000;
   let zoomStatusTimer = null;
   let mediaTitleFeedbackTimer = null;
   let mediaCaptionVisible = true;
-  // 虚化背景默认关闭；在一次播放器打开期间保持开关状态，切换媒体/组别时只更新背景源。
-  let blurBackgroundEnabled = false;
+  // 虚化背景默认开启；在一次播放器打开期间保持开关状态，切换媒体/组别时只更新背景源。
+  let blurBackgroundEnabled = true;
   let currentBlurBackgroundKey = '';
   let currentBlurBackgroundSource = '';
   let currentImageZoom = 1;
@@ -44,9 +45,24 @@
   let mediaAutoAdvanceTimer = 0;
   let mediaAutoAdvanceStartedAt = 0;
   let videoProgressRaf = 0;
+  // 当前渲染周期内复用高频访问的 DOM/媒体引用，避免视频逐帧更新时反复查询与分配数组。
+  let currentForegroundVideo = null;
+  let currentProgressWrap = null;
+  let currentProgressSegments = [];
+  let currentVideoUiCleanup = null;
+  let currentVideoSizeSync = null;
   let mediaButtonFeedbackTimer = 0;
   let mediaProgressFeedbackTimer = 0;
   let fullscreenActive = false;
+  let fullscreenControlRaf = 0;
+  let fullscreenPointerRaf = 0;
+  let fullscreenNavOverlapTimer = 0;
+  let fullscreenPostRenderTimer = 0;
+  let fullscreenLeftHideTimer = 0;
+  let fullscreenRightHideTimer = 0;
+  let fullscreenCursorHideTimer = 0;
+  let lastFullscreenPointerX = Number.NaN;
+  let lastFullscreenPointerY = Number.NaN;
   // 每个作品组独立记忆自动播放开关；未进入过关闭状态的组默认开启。
   const autoPlayDisabledGroups = new Set();
   let volumeDragState = null;
@@ -54,6 +70,8 @@
   const MIN_IMAGE_ZOOM = 0.1;
   const MAX_IMAGE_ZOOM = 20;
   const IMAGE_ZOOM_STEP = 0.1;
+  const FULLSCREEN_NAV_HIDE_DELAY_MS = 1300;
+  const FULLSCREEN_CURSOR_HIDE_DELAY_MS = 2000;
 
   function normalizeFileEntry(entry) {
     if (typeof entry === 'string') return { name: entry, missing: false };
@@ -93,6 +111,7 @@
   function visibleGroupIndices() {
     return reportItems.map((_, index) => index);
   }
+
 
   function escapeHtml(value) {
     return String(value)
@@ -603,7 +622,11 @@
     btn.style.minWidth = '';
     btn.style.maxWidth = '';
     btn.textContent = '♫ 播放音乐';
-    const baseWidth = Math.ceil(btn.getBoundingClientRect().width || 0);
+    const measuredWidth = Math.ceil(btn.getBoundingClientRect().width || 0);
+    if (measuredWidth > 0) audioButtonBaseWidth = measuredWidth;
+    // 全屏切换媒体时顶部栏为 display:none，现场测量会得到 0；沿用进入全屏前的稳定宽度，
+    // 避免退出全屏后绝对定位的跑马灯内容把按钮短暂压缩成极窄形态。
+    const baseWidth = measuredWidth || audioButtonBaseWidth;
     if (baseWidth > 0) {
       const width = `${baseWidth}px`;
       btn.style.width = width;
@@ -642,6 +665,16 @@
       btn.title = '播放本组音乐';
       btn.setAttribute('aria-label', '播放本组音乐');
     }
+  }
+
+  function refreshAudioButtonLayoutAfterFullscreen() {
+    const btn = document.getElementById('audioToggleBtn');
+    if (!btn) return;
+    const playing = Boolean(currentAudio && !currentAudio.paused);
+    // 强制重新走一次可见状态下的自然宽度测量；跑马灯 epoch 不清零，滚动相位保持连续。
+    btn.classList.remove('is-playing');
+    delete btn.dataset.marqueeKey;
+    updateAudioButton(playing);
   }
 
   function toggleAudio() {
@@ -690,12 +723,23 @@
     );
   }
 
-  function getCurrentVideoElement() { return document.querySelector('#mediaMain .media-content-viewport video'); }
+  function getCurrentVideoElement() {
+    if (currentForegroundVideo?.isConnected) return currentForegroundVideo;
+    currentForegroundVideo = document.querySelector('#mediaMain .media-content-viewport video');
+    return currentForegroundVideo;
+  }
 
   function updateMediaAutoProgress(progress = null, paused = false) {
-    const wrap = document.getElementById('mediaAutoProgress');
+    let wrap = currentProgressWrap;
+    if (!wrap?.isConnected) {
+      wrap = document.getElementById('mediaAutoProgress');
+      currentProgressWrap = wrap;
+      currentProgressSegments = wrap
+        ? Array.from(wrap.querySelectorAll('.media-auto-progress-segment'))
+        : [];
+    }
     if (!wrap) return;
-    const segments = Array.from(wrap.querySelectorAll('.media-auto-progress-segment'));
+    const segments = currentProgressSegments;
     const media = currentFiles[currentMediaIndex];
     const type = media ? classifyMedia(media.name) : '';
     const video = type === 'video' ? getCurrentVideoElement() : null;
@@ -851,15 +895,9 @@
         updateMediaAutoProgress(0, true);
         return;
       }
-      const tickVideo = () => {
-        if (mediaModal.style.display !== 'block' || currentFiles[currentMediaIndex] !== media) return;
-        const duration = Number(video.duration);
-        const progress = Number.isFinite(duration) && duration > 0 ? video.currentTime / duration : 0;
-        updateMediaAutoProgress(progress, video.paused);
-        mediaAutoAdvanceTimer = requestAnimationFrame(tickVideo);
-      };
+      // 视频结束切换由 ended 事件负责；startVideoProgressLoop() 已经逐帧同步线段。
+      // 这里不再启动第二套功能完全相同的 RAF，播放/循环/结束逻辑均不变。
       updateMediaAutoProgress(0, video.paused);
-      mediaAutoAdvanceTimer = requestAnimationFrame(tickVideo);
     }
   }
 
@@ -892,10 +930,9 @@
     currentImageElement = img;
     currentImageViewport = viewport;
     const rect = viewport.getBoundingClientRect();
-    const pad = 8;
-    const vw = Math.max(1, rect.width - pad * 2);
-    const vh = Math.max(1, rect.height - pad * 2);
-    currentImageBaseScale = Math.min(vw / img.naturalWidth, vh / img.naturalHeight, 1);
+    const vw = Math.max(1, rect.width);
+    const vh = Math.max(1, rect.height);
+    currentImageBaseScale = Math.min(vw / img.naturalWidth, vh / img.naturalHeight);
     currentImageZoom = 1;
     currentImagePanX = 0;
     currentImagePanY = 0;
@@ -910,6 +947,7 @@
     if (!img || !img.naturalWidth || !img.naturalHeight) return;
     const scale = currentImageBaseScale * currentImageZoom;
     img.style.transform = `translate3d(calc(-50% + ${currentImagePanX}px), calc(-50% + ${currentImagePanY}px), 0) scale(${scale})`;
+    scheduleFullscreenControlLayoutCheck();
   }
 
   function applyImageZoom() {
@@ -938,14 +976,269 @@
 
   }
 
+  function syncFullscreenToolsStructure(tools, hasMultipleMedia) {
+    if (!tools) return;
+    const existingAutoPlay = tools.querySelector('#fullscreenAutoPlayToggleBtn');
+    if (!hasMultipleMedia) {
+      existingAutoPlay?.remove();
+      return;
+    }
+    if (existingAutoPlay) return;
+
+    const autoPlayButton = document.createElement('button');
+    autoPlayButton.type = 'button';
+    autoPlayButton.className = 'viewer-btn auto-play-toggle';
+    autoPlayButton.id = 'fullscreenAutoPlayToggleBtn';
+    autoPlayButton.setAttribute('onclick', 'toggleAutoPlay()');
+    autoPlayButton.setAttribute('aria-pressed', 'true');
+    autoPlayButton.textContent = '↻ 自动播放：开';
+    const restoreGroupFirst = tools.querySelector('#fullscreenRestoreGroupFirstBtn');
+    tools.insertBefore(autoPlayButton, restoreGroupFirst || null);
+  }
+
+  function getFullscreenControlParts() {
+    const stage = document.querySelector('#mediaContainer .media-stage');
+    if (!stage) return { stage: null, tools: null, left: null, right: null };
+    const left = Array.from(stage.children).find(element =>
+      element.matches?.('.media-nav.media-media-btn')
+    ) || null;
+    return {
+      stage,
+      tools: stage.querySelector('.media-fullscreen-tools'),
+      left,
+      right: stage.querySelector('.media-right-controls')
+    };
+  }
+
+  function renderedRect(element) {
+    if (!element || getComputedStyle(element).display === 'none') return null;
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 ? rect : null;
+  }
+
+  // 识别区域保持与控制组同中心和宽高比，面积精确扩大为原来的两倍。
+  function pointInDoubleAreaRect(x, y, element) {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+    const rect = renderedRect(element);
+    if (!rect) return false;
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    const halfWidth = rect.width * Math.SQRT2 / 2;
+    const halfHeight = rect.height * Math.SQRT2 / 2;
+    return x >= centerX - halfWidth && x <= centerX + halfWidth &&
+      y >= centerY - halfHeight && y <= centerY + halfHeight;
+  }
+
+  function clearFullscreenNavLeaveTimer(side) {
+    const timer = side === 'left' ? fullscreenLeftHideTimer : fullscreenRightHideTimer;
+    if (timer) clearTimeout(timer);
+    if (side === 'left') fullscreenLeftHideTimer = 0;
+    else fullscreenRightHideTimer = 0;
+  }
+
+  function setFullscreenNavGroupVisible(side, visible) {
+    const parts = getFullscreenControlParts();
+    const element = side === 'left' ? parts.left : parts.right;
+    if (!element) return;
+    element.classList.toggle('is-proximity-visible', visible);
+  }
+
+  function scheduleFullscreenNavGroupHide(side) {
+    const parts = getFullscreenControlParts();
+    const element = side === 'left' ? parts.left : parts.right;
+    if (!element?.classList.contains('is-proximity-visible')) return;
+    const currentTimer = side === 'left' ? fullscreenLeftHideTimer : fullscreenRightHideTimer;
+    if (currentTimer) return;
+    const timer = window.setTimeout(() => {
+      if (side === 'left') fullscreenLeftHideTimer = 0;
+      else fullscreenRightHideTimer = 0;
+      setFullscreenNavGroupVisible(side, false);
+    }, FULLSCREEN_NAV_HIDE_DELAY_MS);
+    if (side === 'left') fullscreenLeftHideTimer = timer;
+    else fullscreenRightHideTimer = timer;
+  }
+
+  function updateFullscreenPointerProximity(x, y, updateTools = true) {
+    const parts = getFullscreenControlParts();
+    if (!fullscreenActive || !parts.stage) return;
+
+    // 顶部工具组只跟随真实鼠标活动更新；媒体重绘/布局复查不得让整组重新显隐。
+    if (updateTools) {
+      const nearTools = pointInDoubleAreaRect(x, y, parts.tools);
+      parts.tools?.classList.toggle('is-proximity-visible', nearTools);
+    }
+
+    if (!parts.stage.classList.contains('media-nav-proximity-mode')) {
+      clearFullscreenNavLeaveTimer('left');
+      clearFullscreenNavLeaveTimer('right');
+      setFullscreenNavGroupVisible('left', false);
+      setFullscreenNavGroupVisible('right', false);
+      return;
+    }
+
+    const nearLeft = pointInDoubleAreaRect(x, y, parts.left);
+    const nearRight = pointInDoubleAreaRect(x, y, parts.right);
+    if (nearLeft && !nearRight) {
+      clearFullscreenNavLeaveTimer('left');
+      clearFullscreenNavLeaveTimer('right');
+      setFullscreenNavGroupVisible('left', true);
+      setFullscreenNavGroupVisible('right', false);
+    } else if (nearRight) {
+      clearFullscreenNavLeaveTimer('right');
+      clearFullscreenNavLeaveTimer('left');
+      setFullscreenNavGroupVisible('right', true);
+      setFullscreenNavGroupVisible('left', false);
+    } else {
+      scheduleFullscreenNavGroupHide('left');
+      scheduleFullscreenNavGroupHide('right');
+    }
+  }
+
+  function queueFullscreenPointerProximity(x, y) {
+    lastFullscreenPointerX = x;
+    lastFullscreenPointerY = y;
+    if (!fullscreenActive || fullscreenPointerRaf) return;
+    fullscreenPointerRaf = requestAnimationFrame(() => {
+      fullscreenPointerRaf = 0;
+      updateFullscreenPointerProximity(lastFullscreenPointerX, lastFullscreenPointerY);
+    });
+  }
+
+  function handleFullscreenPointerLeave() {
+    lastFullscreenPointerX = Number.NaN;
+    lastFullscreenPointerY = Number.NaN;
+    if (fullscreenPointerRaf) cancelAnimationFrame(fullscreenPointerRaf);
+    fullscreenPointerRaf = 0;
+    const parts = getFullscreenControlParts();
+    parts.tools?.classList.remove('is-proximity-visible');
+    if (parts.stage?.classList.contains('media-nav-proximity-mode')) {
+      scheduleFullscreenNavGroupHide('left');
+      scheduleFullscreenNavGroupHide('right');
+    }
+  }
+
+  function clearFullscreenCursorHideTimer() {
+    if (fullscreenCursorHideTimer) clearTimeout(fullscreenCursorHideTimer);
+    fullscreenCursorHideTimer = 0;
+  }
+
+  function resetFullscreenCursorVisibility() {
+    clearFullscreenCursorHideTimer();
+    mediaModal.classList.remove('media-cursor-hidden');
+  }
+
+  function registerFullscreenCursorActivity() {
+    if (!fullscreenActive || mediaModal.style.display !== 'block') return;
+    resetFullscreenCursorVisibility();
+    fullscreenCursorHideTimer = window.setTimeout(() => {
+      fullscreenCursorHideTimer = 0;
+      if (fullscreenActive && mediaModal.style.display === 'block') {
+        mediaModal.classList.add('media-cursor-hidden');
+      }
+    }, FULLSCREEN_CURSOR_HIDE_DELAY_MS);
+  }
+
+  function clearFullscreenControlTimers() {
+    if (fullscreenControlRaf) cancelAnimationFrame(fullscreenControlRaf);
+    if (fullscreenPointerRaf) cancelAnimationFrame(fullscreenPointerRaf);
+    if (fullscreenNavOverlapTimer) clearTimeout(fullscreenNavOverlapTimer);
+    if (fullscreenPostRenderTimer) clearTimeout(fullscreenPostRenderTimer);
+    fullscreenControlRaf = 0;
+    fullscreenPointerRaf = 0;
+    fullscreenNavOverlapTimer = 0;
+    fullscreenPostRenderTimer = 0;
+    clearFullscreenNavLeaveTimer('left');
+    clearFullscreenNavLeaveTimer('right');
+  }
+
+  function resetFullscreenControlVisibility(clearPointer = false) {
+    clearFullscreenControlTimers();
+    const parts = getFullscreenControlParts();
+    parts.stage?.classList.remove('media-nav-proximity-mode');
+    parts.tools?.classList.remove('is-proximity-visible');
+    parts.left?.classList.remove('is-proximity-visible');
+    parts.right?.classList.remove('is-proximity-visible');
+    if (clearPointer) {
+      lastFullscreenPointerX = Number.NaN;
+      lastFullscreenPointerY = Number.NaN;
+    }
+  }
+
+  function rectsTouch(a, b) {
+    return a.left <= b.right && a.right >= b.left &&
+      a.top <= b.bottom && a.bottom >= b.top;
+  }
+
+  function currentMediaTouchesFullscreenNav(stage) {
+    const main = stage.querySelector('#mediaMain');
+    if (!main) return false;
+    if (main.getAnimations?.().some(animation => animation.playState === 'running')) return false;
+    const media = main.querySelector('.media-content-viewport > img, .media-content-viewport > video');
+    if (!media || (media.tagName === 'IMG' && media.style.visibility === 'hidden')) return false;
+    const mediaRect = renderedRect(media);
+    if (!mediaRect) return false;
+    const navButtons = Array.from(stage.querySelectorAll('.media-nav')).filter(button =>
+      getComputedStyle(button).display !== 'none'
+    );
+    return navButtons.some(button => {
+      const buttonRect = renderedRect(button);
+      return buttonRect ? rectsTouch(mediaRect, buttonRect) : false;
+    });
+  }
+
+  function runFullscreenControlLayoutCheck() {
+    fullscreenControlRaf = 0;
+    const parts = getFullscreenControlParts();
+    if (!fullscreenActive || !parts.stage) {
+      resetFullscreenControlVisibility(false);
+      return;
+    }
+
+    const overlaps = currentMediaTouchesFullscreenNav(parts.stage);
+    if (!overlaps) {
+      if (fullscreenNavOverlapTimer) clearTimeout(fullscreenNavOverlapTimer);
+      fullscreenNavOverlapTimer = 0;
+      parts.stage.classList.remove('media-nav-proximity-mode');
+      clearFullscreenNavLeaveTimer('left');
+      clearFullscreenNavLeaveTimer('right');
+      setFullscreenNavGroupVisible('left', false);
+      setFullscreenNavGroupVisible('right', false);
+      return;
+    }
+
+    if (parts.stage.classList.contains('media-nav-proximity-mode') || fullscreenNavOverlapTimer) {
+      updateFullscreenPointerProximity(lastFullscreenPointerX, lastFullscreenPointerY, false);
+      return;
+    }
+
+    const armedStage = parts.stage;
+    fullscreenNavOverlapTimer = window.setTimeout(() => {
+      fullscreenNavOverlapTimer = 0;
+      const currentParts = getFullscreenControlParts();
+      if (!fullscreenActive || currentParts.stage !== armedStage ||
+          !currentMediaTouchesFullscreenNav(armedStage)) return;
+      armedStage.classList.add('media-nav-proximity-mode');
+      updateFullscreenPointerProximity(lastFullscreenPointerX, lastFullscreenPointerY, false);
+    }, FULLSCREEN_NAV_HIDE_DELAY_MS);
+  }
+
+  function scheduleFullscreenControlLayoutCheck(delay = 0) {
+    if (delay > 0) {
+      if (fullscreenPostRenderTimer) clearTimeout(fullscreenPostRenderTimer);
+      fullscreenPostRenderTimer = window.setTimeout(() => {
+        fullscreenPostRenderTimer = 0;
+        scheduleFullscreenControlLayoutCheck();
+      }, delay);
+      return;
+    }
+    if (!fullscreenActive || fullscreenControlRaf) return;
+    fullscreenControlRaf = requestAnimationFrame(runFullscreenControlLayoutCheck);
+  }
+
   function updateFullscreenNavVisibility(imageIsZoomedBeyondFit) {
     if (!fullscreenActive) return;
-    const stage = currentImageViewport?.closest('.media-stage') || document.querySelector('.media-stage');
-    if (!stage) return;
-    // 全屏放大图片时仍保留左右媒体切换按钮。
-    stage.querySelectorAll('.media-nav.media-media-btn').forEach(btn => {
-      btn.classList.remove('media-nav-hidden-by-zoom');
-    });
+    // 保留旧入口供缩放、渲染和全屏切换调用；新的判定以媒体与按钮的实际矩形为准。
+    scheduleFullscreenControlLayoutCheck();
   }
 
   function recenterImageWithElasticMotion() {
@@ -961,7 +1254,10 @@
       img.classList.add('media-image-recentering');
     }
     applyImageTransform();
-    window.setTimeout(() => img.classList.remove('media-image-recentering'), 500);
+    window.setTimeout(() => {
+      img.classList.remove('media-image-recentering');
+      scheduleFullscreenControlLayoutCheck();
+    }, 500);
     scheduleMediaAutoAdvance();
   }
 
@@ -1146,8 +1442,8 @@
     currentMediaDirection = '';
     currentGroupDirection = '';
     currentMediaTransition = 'slide';
-    // 每次重新打开播放器都从默认纯黑背景开始。
-    blurBackgroundEnabled = false;
+    // 每次重新打开播放器都恢复默认开启的虚化背景。
+    blurBackgroundEnabled = true;
     currentBlurBackgroundKey = '';
     currentBlurBackgroundSource = '';
     autoPlayDisabledGroups.clear();
@@ -1171,6 +1467,11 @@
   }
 
   function renderViewer() {
+    // 全屏换媒体/换组时复用同一个工具组节点，避免整组随 mediaContainer 重建而闪烁刷新。
+    const preservedFullscreenTools = fullscreenActive
+      ? mediaContainer.querySelector('.media-fullscreen-tools')
+      : null;
+    clearFullscreenControlTimers();
     const item = reportItems[currentGroupIndex] || {};
     const title = String(item.title || '无标题');
     const author = String(item.author || '');
@@ -1186,6 +1487,16 @@
     const hasGroupAudio = Boolean(getGroupAudio(item));
     clearMediaAutoAdvanceTimer();
     stopVideoProgressLoop();
+    if (currentVideoUiCleanup) {
+      currentVideoUiCleanup();
+      currentVideoUiCleanup = null;
+    }
+    currentForegroundVideo = null;
+    currentProgressWrap = null;
+    currentProgressSegments = [];
+    // 视频透明点击层挂在 body 上，不属于 mediaContainer。
+    // 快速连续切组时必须先清理上一视频遗留的点击层，避免旧层叠加干扰当前视频。
+    document.querySelectorAll('.media-video-click-surface').forEach(el => el.remove());
     const previousMain = mediaContainer.querySelector('#mediaMain');
     const previousCaption = mediaContainer.querySelector('.media-group-caption:not(.media-caption-outgoing)');
     const previousMediaName = previousMain?.dataset?.mediaName || '';
@@ -1285,7 +1596,7 @@
             <button type="button" class="media-title media-title-toggle" id="mediaTitleToggle" onclick="toggleMediaCaptionVisibility()" aria-pressed="${mediaCaptionVisible ? 'true' : 'false'}">第 ${groupPosition} 组 · 媒体 ${mediaPosition}</button>
           </div>
           <div class="media-toolbar">
-            <button type="button" class="viewer-btn blur-background-toggle" id="blurBackgroundToggleBtn" onclick="toggleBlurBackground()" aria-pressed="false">○ 虚化背景：关</button>
+            <button type="button" class="viewer-btn blur-background-toggle" id="blurBackgroundToggleBtn" onclick="toggleBlurBackground()" aria-pressed="true">◉ 虚化背景：开</button>
             ${hasMultipleMedia ? '<button type="button" class="viewer-btn auto-play-toggle" id="autoPlayToggleBtn" onclick="toggleAutoPlay()" aria-pressed="true">↻ 自动播放：开</button>' : ''}
             <button type="button" class="viewer-btn" id="restoreGroupFirstBtn" onclick="restoreGroupFirstMedia()">↶ 初始</button>
             <button type="button" class="viewer-btn" id="restoreImageBtn" onclick="restoreCurrentImagePosition()">⌖ 图片初始位置</button>
@@ -1301,7 +1612,7 @@
 
         <div class="media-stage">
           <div class="media-fullscreen-tools" aria-label="全屏工具">
-            <button type="button" class="viewer-btn blur-background-toggle" id="fullscreenBlurBackgroundToggleBtn" onclick="toggleBlurBackground()" aria-pressed="false">○ 虚化背景：关</button>
+            <button type="button" class="viewer-btn blur-background-toggle" id="fullscreenBlurBackgroundToggleBtn" onclick="toggleBlurBackground()" aria-pressed="true">◉ 虚化背景：开</button>
             ${hasMultipleMedia ? '<button type="button" class="viewer-btn auto-play-toggle" id="fullscreenAutoPlayToggleBtn" onclick="toggleAutoPlay()" aria-pressed="true">↻ 自动播放：开</button>' : ''}
             <button type="button" class="viewer-btn" id="fullscreenRestoreGroupFirstBtn" onclick="restoreGroupFirstMedia()">↶ 初始</button>
             <button type="button" class="viewer-btn" id="fullscreenRestoreImageBtn" onclick="restoreCurrentImagePosition()">⌖ 图片初始位置</button>
@@ -1338,6 +1649,18 @@
       </div>
     `;
 
+    if (preservedFullscreenTools) {
+      const renderedFullscreenTools = mediaContainer.querySelector('.media-fullscreen-tools');
+      if (renderedFullscreenTools) {
+        syncFullscreenToolsStructure(preservedFullscreenTools, hasMultipleMedia);
+        renderedFullscreenTools.replaceWith(preservedFullscreenTools);
+      }
+    }
+
+    currentProgressWrap = document.getElementById('mediaAutoProgress');
+    currentProgressSegments = currentProgressWrap
+      ? Array.from(currentProgressWrap.querySelectorAll('.media-auto-progress-segment'))
+      : [];
     bindMediaAutoProgressInteractions();
     bindVolumeRangeInteractions();
     updateAutoPlayButtonUI();
@@ -1395,7 +1718,9 @@
           img.src = fileUrl(media.name);
         } else if (type === 'video') {
           const video = document.createElement('video');
-          video.controls = true;
+          currentForegroundVideo = video;
+          // 切换到视频时默认隐藏原生控制条；点击视频或移动到视频底部时仍按原逻辑显示。
+          video.controls = false;
           video.playsInline = true;
           video.autoplay = true;
           video.muted = false;
@@ -1447,9 +1772,51 @@
           };
 
           let videoControlsTimer = 0;
+          let videoClickSurfaceSyncRaf = 0;
+          const queueVideoClickSurfaceSync = () => {
+            if (videoClickSurfaceSyncRaf) return;
+            videoClickSurfaceSyncRaf = requestAnimationFrame(() => {
+              videoClickSurfaceSyncRaf = 0;
+              syncVideoClickSurface();
+            });
+          };
+          // 切换动画期间，新视频会从屏幕上/下方经过鼠标指针。
+          // 某些浏览器会因此产生 movement=0 的 mouse/pointer move 事件，
+          // 过去会被误判成用户主动移到视频底部，从而偶发弹出原生进度条。
+          // 先给新视频一个略长于 420ms 切换动画的保护期；点击视频不受此限制。
+          let videoHoverControlsArmed = false;
+          const videoHoverArmTimer = window.setTimeout(() => {
+            videoHoverControlsArmed = true;
+          }, 520);
+
+          const isCurrentForegroundVideo = () => (
+            video.isConnected &&
+            currentForegroundVideo === video
+          );
+
+          // 默认等比适配整个播放区域，小视频也放大到至少一边贴合边界。
+          // 只调整前景 video 的布局尺寸，不缩放 controls，也不影响独立虚化背景。
+          const syncVideoDisplaySize = () => {
+            if (!isCurrentForegroundVideo() || !video.videoWidth || !video.videoHeight) return;
+            const width = viewport.clientWidth;
+            const height = viewport.clientHeight;
+            if (!width || !height) return;
+            const scale = video.dataset.sizeMode === 'original'
+              ? 1
+              : Math.min(width / video.videoWidth, height / video.videoHeight);
+            video.style.width = `${video.videoWidth * scale}px`;
+            video.style.height = `${video.videoHeight * scale}px`;
+            queueVideoClickSurfaceSync();
+            scheduleFullscreenControlLayoutCheck();
+          };
+          currentVideoSizeSync = syncVideoDisplaySize;
+          video.addEventListener('resize', syncVideoDisplaySize);
+
           const showVideoControls = () => {
+            // 只允许真正的当前前景视频打开原生 controls；旧视频/离场画面一律忽略。
+            if (!isCurrentForegroundVideo()) return;
             video.controls = true;
-            requestAnimationFrame(syncVideoClickSurface);
+            queueVideoClickSurfaceSync();
             if (videoControlsTimer) clearTimeout(videoControlsTimer);
             videoControlsTimer = setTimeout(() => {
               video.controls = false;
@@ -1466,7 +1833,7 @@
               video.pause();
             }
             showVideoControls();
-            requestAnimationFrame(syncVideoClickSurface);
+            queueVideoClickSurfaceSync();
           };
 
           // controls 可见时由透明层负责视频主体点击，避免原生控制层抢占事件；
@@ -1484,11 +1851,17 @@
             toggleVideoPlayback();
           });
 
-          video.addEventListener('play', () => { showVideoControls(); requestAnimationFrame(syncVideoClickSurface); });
-          video.addEventListener('pause', () => { showVideoControls(); requestAnimationFrame(syncVideoClickSurface); });
-          video.addEventListener('loadedmetadata', () => { showVideoControls(); requestAnimationFrame(syncVideoClickSurface); });
+          // 媒体自身的加载/自动播放事件不再主动弹出控制条，避免切换到视频时进度条默认出现。
+          // 用户点击视频时 toggleVideoPlayback() 仍会调用 showVideoControls()；
+          // 鼠标移动到视频底部区域时也仍会按原逻辑显示。
+          video.addEventListener('play', queueVideoClickSurfaceSync);
+          video.addEventListener('pause', queueVideoClickSurfaceSync);
+          video.addEventListener('loadedmetadata', () => {
+            syncVideoDisplaySize();
+            queueVideoClickSurfaceSync();
+            requestAnimationFrame(() => scheduleFullscreenControlLayoutCheck());
+          });
           video.addEventListener('canplay', () => {
-            showVideoControls();
             if (video.paused) {
               video.muted = false;
               const p = video.play();
@@ -1499,17 +1872,22 @@
                 });
               }
             }
+            requestAnimationFrame(() => scheduleFullscreenControlLayoutCheck());
           }, { once: true });
 
-          // 鼠标移动到视频下方区域时重新显示进度条，并在 2 秒后自动隐藏。
-          video.addEventListener('mousemove', event => {
+          // 鼠标真正移动到视频下方区域时才重新显示进度条，并在 2 秒后自动隐藏。
+          // 切换动画期间禁止 hover 唤醒；movement=0 的几何/合成事件也忽略。
+          const maybeShowVideoControlsFromPointer = event => {
+            if (!videoHoverControlsArmed || !isCurrentForegroundVideo()) return;
+            const movementX = Number(event.movementX) || 0;
+            const movementY = Number(event.movementY) || 0;
+            if (Math.abs(movementX) + Math.abs(movementY) < 0.5) return;
             const rect = video.getBoundingClientRect();
+            if (!rect.width || !rect.height) return;
             if (event.clientY >= rect.bottom - 96) showVideoControls();
-          });
-          video.addEventListener('pointermove', event => {
-            const rect = video.getBoundingClientRect();
-            if (event.clientY >= rect.bottom - 96) showVideoControls();
-          });
+          };
+          video.addEventListener('mousemove', maybeShowVideoControlsFromPointer);
+          video.addEventListener('pointermove', maybeShowVideoControlsFromPointer);
 
           video.addEventListener('ended', () => {
             const multiMedia = currentFiles.length > 1;
@@ -1533,14 +1911,30 @@
             if (p && typeof p.catch === 'function') p.catch(() => {});
           });
 
-          video.addEventListener('error', () => {
-            if (videoControlsTimer) clearTimeout(videoControlsTimer);
+          const cleanupVideoUi = () => {
+            if (videoControlsTimer) {
+              clearTimeout(videoControlsTimer);
+              videoControlsTimer = 0;
+            }
+            clearTimeout(videoHoverArmTimer);
+            if (videoClickSurfaceSyncRaf) {
+              cancelAnimationFrame(videoClickSurfaceSyncRaf);
+              videoClickSurfaceSyncRaf = 0;
+            }
             videoClickSurface.remove();
+            if (currentVideoSizeSync === syncVideoDisplaySize) currentVideoSizeSync = null;
+            if (currentForegroundVideo === video) currentForegroundVideo = null;
+          };
+          currentVideoUiCleanup = cleanupVideoUi;
+          video.addEventListener('error', () => {
+            // 旧视频的延迟 error 不能清理已切换到前台的新视频 UI。
+            cleanupVideoUi();
+            if (currentVideoUiCleanup === cleanupVideoUi) currentVideoUiCleanup = null;
             viewport.innerHTML = `<div class="media-empty">视频无法加载：<br><br>${escapeHtml(media.name)}</div>`;
           });
           viewport.appendChild(video);
           video.src = videoSourceUrl;
-          requestAnimationFrame(syncVideoClickSurface);
+          queueVideoClickSurfaceSync();
           // 无论自动播放开关状态如何，视频自身的进度都持续同步到当前线段。
           // 自动播放关闭时不启动“切换媒体”计时器，但仍保留独立的视频进度 RAF。
           startVideoProgressLoop(video);
@@ -1549,7 +1943,8 @@
           video.addEventListener('loadedmetadata', () => updateMediaAutoProgress(0, video.paused));
           video.addEventListener('durationchange', () => updateMediaAutoProgress(null, video.paused));
           video.addEventListener('seeked', () => updateMediaAutoProgress(null, video.paused));
-          showVideoControls();
+          video.controls = false;
+          videoClickSurface.style.display = 'none';
         }
       }
     }
@@ -1563,6 +1958,11 @@
     updateVolumeUI();
     if (currentAudio && !currentAudio.paused) updateAudioButton(true);
     updateFullscreenNavVisibility(false);
+    if (fullscreenActive) {
+      updateFullscreenPointerProximity(lastFullscreenPointerX, lastFullscreenPointerY, false);
+      // 避开 420ms 媒体入场动画，防止移动中的媒体经过按钮时产生误判。
+      scheduleFullscreenControlLayoutCheck(470);
+    }
     // dissolve 是一次性过渡标记；渲染完成后恢复默认，后续手动操作始终使用滑动。
     currentMediaTransition = 'slide';
   }
@@ -1618,6 +2018,7 @@
     applyImageZoom();
     window.setTimeout(() => {
       if (img.isConnected) img.classList.remove('media-image-recentering');
+      scheduleFullscreenControlLayoutCheck();
       scheduleMediaAutoAdvance();
     }, 500);
   }
@@ -1644,6 +2045,7 @@
             applyImageZoom();
             window.setTimeout(() => {
               if (img.isConnected) img.classList.remove('media-image-recentering');
+              scheduleFullscreenControlLayoutCheck();
               scheduleMediaAutoAdvance();
             }, 500);
           }
@@ -1728,11 +2130,23 @@
   }
 
   function closeModal() {
+    const returnRow = document.querySelector('[data-dcc-group-index="' + currentGroupIndex + '"]');
+    let fullscreenExit = null;
+    if (document.fullscreenElement) {
+      try {
+        fullscreenExit = Promise.resolve(document.exitFullscreen?.()).catch(() => {});
+      } catch (_) {}
+    }
+    resetFullscreenControlVisibility(true);
+    resetFullscreenCursorVisibility();
     clearMediaAutoAdvanceTimer();
     stopVideoProgressLoop();
+    if (currentVideoUiCleanup) {
+      currentVideoUiCleanup();
+      currentVideoUiCleanup = null;
+    }
     clearAudioStatusTimer();
     clearZoomStatusTimer();
-    if (document.fullscreenElement) document.exitFullscreen?.().catch?.(() => {});
     if (currentAudio) {
       currentAudio.pause();
       currentAudio.src = '';
@@ -1740,13 +2154,15 @@
     }
     currentAudio = null;
     currentAudioGroupIndex = -1;
+    audioButtonBaseWidth = 0;
     mediaModal.style.display = 'none';
     mediaModal.setAttribute('aria-hidden', 'true');
     mediaContainer.innerHTML = '';
+    document.querySelectorAll('.media-video-click-surface').forEach(el => el.remove());
     document.body.style.overflow = '';
     currentGroupIndex = -1;
     currentMediaIndex = 0;
-    blurBackgroundEnabled = false;
+    blurBackgroundEnabled = true;
     currentBlurBackgroundKey = '';
     currentBlurBackgroundSource = '';
     currentImageZoom = 1;
@@ -1755,10 +2171,26 @@
     currentImagePanY = 0;
     currentImageElement = null;
     currentImageViewport = null;
+    currentForegroundVideo = null;
+    currentProgressWrap = null;
+    currentProgressSegments = [];
     imageDragState = null;
     imageClickState = null;
     if (dragRaf) { cancelAnimationFrame(dragRaf); dragRaf = 0; }
     currentFiles = [];
+
+    const scrollBackToClosedGroup = () => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (mediaModal.style.display === 'block') return;
+          if (returnRow?.isConnected) {
+            returnRow.scrollIntoView({ block: 'center', inline: 'nearest' });
+          }
+        });
+      });
+    };
+    if (fullscreenExit) fullscreenExit.then(scrollBackToClosedGroup);
+    else scrollBackToClosedGroup();
   }
 
   mediaModal.addEventListener('click', event => {
@@ -1770,6 +2202,33 @@
     }
   }, true);
 
+  // 全屏工具的命中测试统一放在 document 捕获阶段；不创建透明覆盖层，
+  // 因而不会遮挡图片拖拽、视频点击或浏览器原生视频控件。
+  document.addEventListener('pointermove', event => {
+    if (mediaModal.style.display !== 'block') return;
+    if (event.pointerType && event.pointerType !== 'mouse') return;
+    const pointerActuallyMoved = !Number.isFinite(lastFullscreenPointerX) ||
+      !Number.isFinite(lastFullscreenPointerY) ||
+      event.clientX !== lastFullscreenPointerX || event.clientY !== lastFullscreenPointerY ||
+      Boolean(event.movementX || event.movementY);
+    lastFullscreenPointerX = event.clientX;
+    lastFullscreenPointerY = event.clientY;
+    if (!fullscreenActive) return;
+    if (pointerActuallyMoved) {
+      registerFullscreenCursorActivity();
+      queueFullscreenPointerProximity(event.clientX, event.clientY);
+    }
+  }, { capture: true, passive: true });
+
+  document.addEventListener('pointerout', event => {
+    if (!fullscreenActive || event.relatedTarget) return;
+    handleFullscreenPointerLeave();
+  }, true);
+
+  window.addEventListener('blur', () => {
+    if (fullscreenActive) handleFullscreenPointerLeave();
+  });
+
   mediaModal.addEventListener('wheel', event => {
     if (mediaModal.style.display !== 'block') return;
     const target = event.target;
@@ -1778,9 +2237,13 @@
   }, { passive: false });
 
   // 鼠标侧键/肩键/滚轮按下：统一在 document 捕获阶段处理。
-  // 3 = 下一组，4 = 上一组，1 = 滚轮按下（图片初始位置）。
+  // 3 = 下一组，4 = 上一组，1 = 滚轮按下（图片初始位置 / 视频原始与默认尺寸切换）。
   document.addEventListener('mousedown', event => {
     if (mediaModal.style.display !== 'block') return;
+    // 只有鼠标左、右键属于指针活动；中键、肩键和键盘不会让隐藏的指针重新出现。
+    if (fullscreenActive && (event.button === 0 || event.button === 2)) {
+      registerFullscreenCursorActivity();
+    }
     if (event.button === 3) {
       event.preventDefault();
       showNextGroup();
@@ -1794,6 +2257,13 @@
       if (media && classifyMedia(media.name) === 'image') {
         event.preventDefault();
         restoreCurrentImagePosition();
+      } else if (media && classifyMedia(media.name) === 'video') {
+        event.preventDefault();
+        const video = getCurrentVideoElement();
+        if (video && currentVideoSizeSync) {
+          video.dataset.sizeMode = video.dataset.sizeMode === 'original' ? 'fit' : 'original';
+          currentVideoSizeSync();
+        }
       }
     }
   }, true);
@@ -1837,10 +2307,15 @@
 
   document.addEventListener('fullscreenchange', () => {
     fullscreenActive = Boolean(document.fullscreenElement);
+    resetFullscreenControlVisibility(!fullscreenActive);
+    if (fullscreenActive) registerFullscreenCursorActivity();
+    else resetFullscreenCursorVisibility();
     clearMediaAutoAdvanceTimer();
     // 全屏前后查看区域尺寸会发生变化，重新计算“自适应基准”，并将图片回到真正的中心。
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
+        if (!fullscreenActive) refreshAudioButtonLayoutAfterFullscreen();
+        if (currentVideoSizeSync) currentVideoSizeSync();
         const img = document.querySelector('#mediaMain img');
         if (img && img.naturalWidth) {
           const savedZoom = currentImageZoom || 1;
@@ -1854,13 +2329,18 @@
           updateFullscreenNavVisibility(false);
           scheduleMediaAutoAdvance();
         }
+        if (fullscreenActive) {
+          updateFullscreenPointerProximity(lastFullscreenPointerX, lastFullscreenPointerY);
+          scheduleFullscreenControlLayoutCheck(470);
+        }
       });
     });
   });
 
   window.addEventListener('resize', () => {
     requestAnimationFrame(fitMediaCaptionOverflow);
-    const currentVideo = document.querySelector('#mediaMain video');
+    if (currentVideoSizeSync) currentVideoSizeSync();
+    const currentVideo = getCurrentVideoElement();
     const clickSurface = document.querySelector('.media-video-click-surface');
     if (currentVideo && clickSurface) {
       const rect = currentVideo.getBoundingClientRect();
@@ -1881,8 +2361,25 @@
     if (currentMedia && currentFiles.length > 1) {
       scheduleMediaAutoAdvance();
     }
+    scheduleFullscreenControlLayoutCheck();
   });
-    
+
+  // 原报告按钮使用内联事件；独立封装后仍需向这些按钮公开原有处理函数。
+  Object.assign(window, {
+    toggleMediaCaptionVisibility,
+    toggleBlurBackground,
+    toggleAutoPlay,
+    restoreGroupFirstMedia,
+    restoreCurrentImagePosition,
+    toggleAudio,
+    setAudioVolume,
+    toggleFullscreen,
+    showPreviousMedia,
+    showNextMedia,
+    showPreviousGroup,
+    showNextGroup,
+    flashMediaButton
+  });
 
   window.DCCPlayer = Object.freeze({
     open(index = 0) { openModalByGroup(index); },

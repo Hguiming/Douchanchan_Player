@@ -21,9 +21,9 @@
 </head>
 <body>
   <main class="demo-shell">
-    <p class="demo-eyebrow">DCC WEB MEDIA PLAYER · V18 EXTRACTION</p>
+    <p class="demo-eyebrow">DCC WEB MEDIA PLAYER · V26 EXTRACTION</p>
     <h1>为抖铲铲编写的网页端仿抖音图文播放器</h1>
-    <p class="demo-lead">这是从统计报告 v18 中抽离出的独立演示版。播放器保留图片/视频混播、组内/组间方向动画、自动播放、MP3、图片缩放拖拽、全屏、虚化背景、作品信息等交互。</p>
+    <p class="demo-lead">这是从统计报告 v26 图片尺寸适配版 中抽离出的独立演示版。播放器保留图片/视频混播、组内/组间方向动画、自动播放、MP3、图片缩放拖拽、全屏、虚化背景、作品信息等交互。</p>
     <section class="demo-grid" id="demoGrid" aria-label="演示作品组"></section>
     <p class="demo-note">演示媒体均为本项目生成的占位素材，不包含原统计报告中的真实作品数据。</p>
   </main>
@@ -40,6 +40,7 @@
     window.DCC_PLAYER_ITEMS.forEach((item, index) => {
       const card = document.createElement('article');
       card.className = 'demo-card';
+      card.dataset.dccGroupIndex = String(index);
       const mediaCount = item.filenames.filter(name => /\.(?:jpe?g|png|gif|webp|avif|bmp|svg|mp4|webm|ogv|mov|m4v)$/i.test(name)).length;
       card.innerHTML = `<h2>第 ${index + 1} 组</h2><p>${item.author} · ${mediaCount} 个媒体</p><button type="button">打开播放器</button>`;
       card.querySelector('button').addEventListener('click', () => DCCPlayer.open(index));
